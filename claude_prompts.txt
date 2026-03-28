@@ -1,0 +1,185 @@
+give me python code to read all the csvs in a folder and inspect the columns dtypes and null summary
+
+Here's a quick utility for that:
+
+python
+import pandas as pd
+from pathlib import Path
+
+def inspect_csvs(folder_path: str) -> None:
+    folder = Path(folder_path)
+    csv_files = sorted(folder.glob("*.csv"))
+
+    if not csv_files:
+        print(f"No CSV files found in {folder}")
+        return
+
+    for csv_file in csv_files:
+        df = pd.read_csv(csv_file)
+        print(f"\n{'='*60}")
+        print(f"FILE: {csv_file.name}  ({len(df)} rows, {len(df.columns)} cols)")
+        print(f"{'='*60}")
+
+        summary = pd.DataFrame({
+            "dtype": df.dtypes,
+            "non_null": df.notnull().sum(),
+            "null": df.isnull().sum(),
+            "null_pct": (df.isnull().sum() / len(df) * 100).round(2),
+            "unique": df.nunique(),
+            "sample": df.iloc[0] if len(df) > 0 else None,
+        })
+        print(summary.to_string())
+
+# Usage
+inspect_csvs("/path/to/your/folder")
+This prints, per CSV: the filename, row/column counts, and a per-column table showing dtype, non-null count, null count, null percentage, unique values, and a sample value from the first row. Swap the path and you're good to go.
+
+
+Found 11 CSV files ================================================================================ ================================================================================ FILE: olist_closed_deals_dataset.csv Shape: 842 rows x 14 cols ----------------------------------------
+
+pasted
+
+I have the Olist e-commerce dataset with 11 CSV files. I need to build a per-customer propensity scoring model. Help me understand which tables are relevant for a Lead, Browsing, Purchase pipeline and which ones I can skip
+
+Good, you've got the full Olist dataset laid out. Let me break down what's relevant for your propensity scoring pipeline.
+
+Core tables you need:
+
+The marketing qualified leads (olist_marketing_qualified_leads_dataset.csv) and closed deals (olist_closed_deals_dataset.csv) form your lead-to-seller conversion funnel. MQL gives you first contact date, landing page, and acquisition origin; closed deals tells you which MQLs actually converted to sellers. Together they define your positive/negative labels for a seller-side propensity model. Join on mql_id.
+
+For the customer purchase pipeline, these four are your backbone:
+
+olist_orders_dataset.csv — the central fact table. Every order with status, timestamps for purchase → approval → carrier → delivery. This is where you derive recency, frequency, and lifecycle features.
+olist_order_items_dataset.csv — line-item detail with price, freight, product, and seller per item. Gives you AOV, basket size, category diversity, and spend features.
+olist_order_payments_dataset.csv — payment method and installment behavior. Installment count is a strong signal for purchase power and price sensitivity.
+olist_order_reviews_dataset.csv — review scores and whether a customer left a comment. Satisfaction signals feed directly into repeat-purchase propensity.
+Supporting/enrichment tables:
+
+olist_customers_dataset.csv — maps customer_id (per-order) to customer_unique_id (per-person) plus zip/city/state. You must use customer_unique_id to deduplicate customers across orders. Also gives you geo features.
+olist_products_dataset.csv + product_category_name_translation.csv — category names and physical attributes. Useful for building category-preference features (e.g., does this customer buy electronics vs. fashion?). Join products → translation to get English category names.
+olist_sellers_dataset.csv — seller location. Mildly useful if you want seller-customer distance features or seller quality aggregates, but low priority.
+Skip or deprioritize:
+
+olist_geolocation_dataset.csv — 1M rows of zip-to-lat/lng mappings with many-to-many duplicates. Noisy and heavy. Only worth touching if you explicitly want haversine distance features between customer and seller, and even then you'd heavily deduplicate first. Skip for v1.
+The two separate modeling tracks:
+
+One thing to be clear on — this dataset supports two distinct propensity problems. The lead-to-seller funnel (MQL → closed deal) is about predicting which marketing leads become Olist sellers. The customer purchase funnel (orders/items/payments/reviews) is about predicting customer behavior like repeat purchase or conversion value. They don't share entities directly — seller_id in closed deals connects to seller_id in order items, but that's a downstream link, not a shared customer.
+
+For the Scowtt take-home, you're almost certainly focused on the customer-side: per-customer propensity scoring and conversion value prediction using orders + items + payments + reviews + customers + products. The MQL/closed deals tables are a separate funnel you could model as a bonus or ignore entirely depending on scope.
+
+My master table has 775 orders with null product_id and 3,229 null delivery dates. Should I drop these rows or keep them? What's the tradeoff?
+
+
+These are two different problems and deserve different treatment.
+
+The 775 null product_id rows — these are almost certainly cancelled or unavailable orders where no item-level data exists. Without product info you can't compute basket features, category preferences, or item-level monetary values. For a propensity model that depends on purchase behavior features, these rows are structurally incomplete. Drop them. They represent <1% of your ~99k orders, so the information loss is negligible.
+
+The 3,229 null delivery dates are more nuanced. Cross-reference them against order_status — you'll likely find these are orders with status shipped, canceled, unavailable, or processing rather than delivered. The tradeoff:
+
+If you drop them, you lose signal from customers who placed orders but never received them. That's actually behavioral information — a customer who had a cancelled order might have different repeat-purchase propensity than one with a clean delivery history.
+
+If you keep them, you preserve that signal but need to handle the nulls carefully in any delivery-time features (like delivery_delay = delivered_date - estimated_date). Those features would just be null for these rows, which is fine if your model handles missingness or you encode a binary flag like was_delivered.
+
+My recommendation: keep the null-delivery rows but add an is_delivered flag column and compute delivery-time features only for delivered orders (leaving NaN otherwise). This way your model can learn from both the completion signal and the behavioral signal of non-delivery. For tree-based models like XGBoost this works natively since they handle NaN splits. If you're using logistic regression, impute with a sentinel or rely on the flag.
+
+One thing to double-check: filter on order_status == 'delivered' specifically when computing delivery satisfaction features, but keep all statuses in your master table for frequency/recency/monetary aggregations. A cancelled order still tells you something about that customer.
+
+I have 97% one-time buyers in this dataset. How should I frame the prediction problem predicting first purchase or repeat purchase? And how do I handle the class imbalance?
+
+
+This is the critical design decision for the whole project. Let me walk through both framings and why one is clearly better here.
+
+Predicting first purchase (conversion) isn't viable with this dataset. You don't have pre-purchase browsing data — no page views, no add-to-cart events, no session logs. Every row in your master table is someone who already bought. You can't model the conversion funnel from visitor to buyer without a negative class of non-buyers, which doesn't exist here.
+
+Repeat purchase propensity is the right framing. Your label is binary: did this customer_unique_id place more than one order? The 97/3 split is extreme but that's actually realistic for e-commerce — most customers on marketplace platforms are one-and-done. This is a strength of your analysis, not a flaw, as long as you handle it properly.
+
+On class imbalance — don't oversample. Here's why:
+
+SMOTE and random oversampling are tempting but they distort the predicted probabilities. For a propensity scoring system, you need well-calibrated probabilities, not just good classification. A customer with 8% repeat probability is meaningfully different from one with 2%, and that ranking is what drives business decisions like targeting and retention spend. Oversampling wrecks that calibration.
+
+Instead, do three things:
+
+First, use scale_pos_weight in XGBoost (set it to roughly 97/3 ≈ 32). This adjusts the loss function without fabricating synthetic samples, so your predicted probabilities stay interpretable. LightGBM has is_unbalanced=True for the same effect.
+
+Second, optimize on the right metrics. Accuracy is meaningless at 97/3 — a constant predictor gets 97%. Use PR-AUC (precision-recall AUC) as your primary metric since it focuses on the minority class. ROC-AUC is your secondary. Log-loss is good for checking calibration. Report precision/recall/F1 at a business-relevant threshold, not the default 0.5.
+
+Third, engineer features that give the model a fighting chance on the minority class. The strongest predictors of repeat purchase in e-commerce are typically: review score on first order (satisfied customers return), delivery speed vs. estimate (positive surprise drives loyalty), product category (consumables repeat more than furniture), payment installments (low installments may signal impulse buys), and freight-to-price ratio (shipping pain suppresses repeat). Time-based features like days between first purchase and dataset end give you an exposure window — someone who bought last week hasn't had time to repeat, which is fundamentally different from someone who bought two years ago and never came back.
+
+One structural caveat: with only ~3% repeaters, your positive class is roughly 2,500–3,000 customers. That's actually workable for tree-based models, but be rigorous about your validation strategy. Use stratified k-fold (5-fold) to make sure every fold has enough positive examples. Don't do a single random train/test split — you'd get unstable estimates with so few positives in the test set.
+
+For the Scowtt deliverable, framing this as "which customers are most likely to return, and what's their predicted lifetime value" is a much stronger narrative than a conversion model you can't properly support with the available data.
+
+Help me decide the temporal cutoff date. My data runs Sep 2016 to Oct 2018 but volume drops after Aug 2018. What's the tradeoff between earlier cutoffs vs later cutoffs ? How should i decide between the more positives vs more features?
+
+
+This is the most underrated modeling decision and it directly affects both your label quality and feature richness. Let me lay out the tension.
+
+The core tradeoff:
+
+An earlier cutoff (say June 2018) gives customers in your training set a longer observation window afterward to make a repeat purchase. More of your true repeaters actually show up as positive labels, so your labels are cleaner and you have more positives to learn from. But your feature window is shorter — customers who first purchased in May 2018 only have a few months of prior behavior to featurize.
+
+A later cutoff (say August 2018) gives you more historical data to build richer features from, but the observation window after the cutoff shrinks. Customers who would have repeated in month 4 or 5 get mislabeled as non-repeaters because you ran out of data. This is called right-censoring and it quietly poisons your positive class by diluting it with false negatives.
+
+How to decide empirically:
+
+Look at the repeat purchase time distribution. Take your known repeaters and compute the gap in days between their first and second order. If 80% of repeat purchases happen within 90 days, then you need at least a 90-day observation window after your cutoff to capture most of them. If the median gap is 60 days but the 90th percentile is 150 days, you're making a real sacrifice no matter what you pick.
+
+Run this quickly:
+
+python
+repeat_customers = orders.groupby('customer_unique_id').filter(lambda x: len(x) > 1)
+first = repeat_customers.groupby('customer_unique_id')['order_purchase_timestamp'].min()
+second = repeat_customers.groupby('customer_unique_id')['order_purchase_timestamp'].nth(1)
+gap = (second - first).dt.days
+print(gap.describe(percentiles=[.5, .75, .8, .9]))
+That distribution tells you the minimum observation window you can afford.
+
+My recommendation: cutoff around May–June 2018. Here's the reasoning:
+
+Your data is reliable through August 2018, giving you roughly 60–90 days of observation window. Volume drops after August so September/October data is incomplete and shouldn't be trusted for label construction. A May or June cutoff balances both sides — you still have 20+ months of purchase history for feature engineering (Sept 2016 through cutoff), and a clean 2–3 month window for label observation.
+
+Concretely, split it like this: features are computed from everything before the cutoff date for each customer, and the label is whether that customer_unique_id placed another order after the cutoff through August 2018. Exclude any customer whose first purchase is after the cutoff — they have no feature history.
+
+One more thing: this temporal split should also be your train/test boundary, not random k-fold alone. Train on customers whose first purchase falls in an earlier window, test on customers whose first purchase is closer to the cutoff. This simulates real deployment where you're always predicting forward in time. Random splitting leaks future information and inflates your metrics. You can still use stratified k-fold within the training set for hyperparameter tuning, but your final holdout evaluation should respect time.
+
+My XGBoost model has Train AUC 0.91 but Test AUC 0.60 which is   overfitting. What regularization parameters should I tune to close this gap?
+
+
+A 31-point AUC gap is severe overfitting. Before jumping to hyperparameter tuning, let me flag the two most likely root causes, because regularization alone won't fix a fundamentally leaky setup.
+
+Check these first:
+
+First, target leakage. With a 97/3 class split, even a small leak produces exactly this pattern — near-perfect train, garbage test. Audit any feature that's derived from post-cutoff data or that mechanically encodes the label. Common culprits: total order count (directly encodes repeat), lifetime revenue computed across the full timeline, or review features from the second order leaking into features for the first. Every feature should be computed strictly from data before your temporal cutoff for that customer.
+
+Second, feature cardinality. If you're passing in raw customer_city, product_category, or seller_id as categorical features with hundreds or thousands of levels, XGBoost will memorize the training set by splitting on rare categories that happen to correlate with the label. Either frequency-encode these, group low-frequency levels into an "other" bucket, or use target-encoded aggregates like avg_review_score_for_category instead of the raw category.
+
+Once you've ruled those out, here's the regularization strategy:
+
+The three most impactful knobs for closing a train/test gap in XGBoost are tree depth, row/column subsampling, and minimum child weight. Tune them in this order of priority.
+
+Start by cutting max_depth from the default 6 down to 3 or 4. Deep trees are the single biggest overfitting driver with small positive classes because the model can build paths that isolate individual repeaters. With only ~2,500 positives, you want shallow, generalizable splits.
+
+Next, set subsample to 0.7 and colsample_bytree to 0.7. This forces each tree to see only 70% of rows and 70% of features, which acts like bagging and breaks co-adaptation between trees. You can go as low as 0.5 on both if the gap persists.
+
+Raise min_child_weight to 5–10. The default of 1 lets the model create leaf nodes with a single positive example, which is pure memorization. Increasing this requires each leaf to have more supporting samples before splitting.
+
+Then add explicit L1/L2 penalties: reg_alpha (L1) around 0.1–1.0 and reg_lambda (L2) around 1–5. These penalize large leaf scores and prune away splits with marginal gain.
+
+Finally, reduce n_estimators and learning_rate together. A lower learning rate (0.01–0.05) with early stopping on your validation set's PR-AUC will naturally find the right number of rounds without overshooting.
+
+A practical tuning grid to start with:
+
+python
+param_grid = {
+    'max_depth': [3, 4],
+    'min_child_weight': [5, 10, 20],
+    'subsample': [0.6, 0.7, 0.8],
+    'colsample_bytree': [0.6, 0.7],
+    'reg_alpha': [0.1, 1.0],
+    'reg_lambda': [1.0, 5.0],
+    'learning_rate': [0.01, 0.05],
+    'scale_pos_weight': [30],
+}
+Use early stopping with eval_metric='aucpr' on a stratified validation fold rather than fixing n_estimators. This lets each hyperparameter combination find its own optimal round count.
+
+Realistic expectations: with a 97/3 split and ~2,500 positives on a dataset without browsing behavior, a test ROC-AUC of 0.70–0.75 is a solid result. If you're still stuck below 0.65 after regularization, the problem is almost certainly in the features or the label construction, not the model complexity. Go back to feature engineering before adding more tuning rounds.
